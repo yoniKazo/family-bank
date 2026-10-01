@@ -271,6 +271,6 @@ grant  execute on function public.decide_request(uuid, boolean, text), public.ca
 --  ההורים — להחליף למיילים האמיתיים (Gmail) ולהריץ
 -- ============================================================
 insert into public.members (email, role, display_name) values
-  ('parent1@gmail.com', 'parent', 'אבא'),
-  ('parent2@gmail.com', 'parent', 'אמא')
+  ('yonu.kazokin@gmail.com', 'parent', 'אבא'),
+  ('yonuka3@gmail.com', 'parent', 'אמא')
 on conflict (email) do update set role = 'parent', display_name = excluded.display_name;
