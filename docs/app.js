@@ -65,13 +65,19 @@ async function boot() {
   if (state.me.role === 'parent') {
     const members = await q(sb.from('members').select('email, display_name, role'));
     state.names = Object.fromEntries(members.filter((m) => m.display_name).map((m) => [m.email, m.display_name]));
+    sb.channel('requests')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'requests' }, ({ eventType, new: r }) => {
+        if (eventType === 'INSERT') toast(`בקשה חדשה מ${who(r.created_by)}: ${r.kind === 'deposit' ? 'הפקדה' : 'משיכה'} של ${money(r.amount)}`);
+        if (location.hash === '#/requests') route(); else updateBadge();
+      })
+      .subscribe();
   }
   route();
 }
 
 sb.auth.onAuthStateChange((event) => {
   // לא לקרוא ל-Supabase מתוך ה-callback עצמו
-  if (event === 'SIGNED_OUT') { state.me = null; setTimeout(renderLogin, 0); }
+  if (event === 'SIGNED_OUT') { state.me = null; sb.removeAllChannels(); setTimeout(renderLogin, 0); }
   if (event === 'SIGNED_IN' && !state.me) setTimeout(boot, 0);
 });
 
@@ -197,7 +203,7 @@ async function balanceOf(childId) {
 // ---------- מסכי הורה ----------
 
 async function parentHome() {
-  const balances = await q(sb.from('balances').select('*').eq('active', true).order('name'));
+  const balances = await q(sb.from('balances').select('*').eq('active', true).order('sort_order').order('name'));
   const total = balances.reduce((s, b) => s + Number(b.balance), 0);
   app.innerHTML = shell(`
     <div class="summary"><span class="muted">סה״כ בקופה</span><strong>${money(total)}</strong></div>
@@ -261,7 +267,7 @@ async function parentRequests() {
 
 async function parentManage() {
   const [children, members] = await Promise.all([
-    q(sb.from('children').select('*').order('active', { ascending: false }).order('name')),
+    q(sb.from('children').select('*').order('active', { ascending: false }).order('sort_order').order('name')),
     q(sb.from('members').select('*').eq('role', 'child')),
   ]);
   const emailOf = Object.fromEntries(members.map((m) => [m.child_id, m.email]));
@@ -279,6 +285,7 @@ async function parentManage() {
         <form class="manage-row ${c.active ? '' : 'inactive'}" data-form="save-child" data-id="${c.id}" data-old-email="${esc(emailOf[c.id] || '')}">
           <label class="field"><span>שם</span><input name="name" value="${esc(c.name)}" required maxlength="40"></label>
           <label class="field"><span>Google</span><input name="email" type="email" dir="ltr" value="${esc(emailOf[c.id] || '')}" placeholder="ללא כניסה"></label>
+          <label class="field"><span>מיון</span><input name="sort_order" type="number" inputmode="numeric" step="1" required value="${c.sort_order}"></label>
           <label class="check"><input type="checkbox" name="active" ${c.active ? 'checked' : ''}> פעיל</label>
           <button class="btn small">שמירה</button>
         </form>
@@ -432,7 +439,7 @@ const forms = {
     const id = f.dataset.id;
     const name = d.get('name').trim();
     const email = d.get('email').trim().toLowerCase();
-    await q(sb.from('children').update({ name, active: d.get('active') === 'on' }).eq('id', id));
+    await q(sb.from('children').update({ name, active: d.get('active') === 'on', sort_order: Number(d.get('sort_order')) }).eq('id', id));
     if (email !== f.dataset.oldEmail) {
       await q(sb.from('members').delete().eq('child_id', id));
       if (email) await q(sb.from('members').insert({ email, role: 'child', child_id: id, display_name: name }));

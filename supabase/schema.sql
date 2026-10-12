@@ -26,6 +26,8 @@ create table if not exists public.children (
   active      boolean not null default true,
   created_at  timestamptz not null default now()
 );
+-- סדר התצוגה (קטן קודם; בשוויון — לפי שם)
+alter table public.children add column if not exists sort_order int not null default 0;
 
 -- רשימת ההרשאות: רק מי שמופיע כאן יכול לראות משהו
 create table if not exists public.members (
@@ -144,7 +146,8 @@ create trigger requests_insert before insert on public.requests
 create or replace view public.balances with (security_invoker = true) as
   select c.id as child_id, c.name, c.active,
          coalesce(sum(t.amount) filter (where not t.voided), 0)::numeric(12,2) as balance,
-         max(t.occurred_on) filter (where not t.voided) as last_activity
+         max(t.occurred_on) filter (where not t.voided) as last_activity,
+         c.sort_order
   from public.children c
   left join public.transactions t on t.child_id = c.id
   group by c.id;
@@ -251,6 +254,15 @@ create policy requests_select on public.requests for select to authenticated
 drop policy if exists requests_insert on public.requests;
 create policy requests_insert on public.requests for insert to authenticated
   with check (child_id = my_child_id());
+
+-- ---------- Realtime: הורים מקבלים עדכון מיידי על בקשות (RLS חל גם כאן) ----------
+
+do $$ begin
+  if not exists (select 1 from pg_publication_tables
+                 where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'requests') then
+    alter publication supabase_realtime add table public.requests;
+  end if;
+end $$;
 
 -- ---------- הרשאות ----------
 
