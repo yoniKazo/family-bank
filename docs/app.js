@@ -1,5 +1,5 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
-import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
+import { SUPABASE_URL, SUPABASE_ANON_KEY, VAPID_PUBLIC_KEY } from './config.js';
 
 const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
@@ -51,6 +51,20 @@ async function q(promise) {
 
 const go = (hash) => { if (location.hash === hash) route(); else location.hash = hash; };
 
+// ---------- התראות push ----------
+
+const pushSupported = 'PushManager' in window;
+const b64url = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+
+// רושם את המכשיר (או מרענן רישום קיים) בטבלת המנויים
+async function subscribePush() {
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription()
+    || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64url(VAPID_PUBLIC_KEY) });
+  const { endpoint, keys } = sub.toJSON();
+  await q(sb.from('push_subscriptions').upsert({ endpoint, keys }));
+}
+
 // ---------- התחברות ----------
 
 async function boot() {
@@ -71,6 +85,7 @@ async function boot() {
         if (location.hash === '#/requests') route(); else updateBadge();
       })
       .subscribe();
+    if (pushSupported && Notification.permission === 'granted') subscribePush().catch(() => {});
   }
   route();
 }
@@ -291,6 +306,14 @@ async function parentManage() {
         </form>
       </li>`).join('')}</ul>` : '<p class="empty">עוד אין ילדים</p>'}
     <p class="muted small">ילד לא פעיל נעלם מהמסך הראשי ולא יכול להתחבר. ההיסטוריה שלו נשמרת.</p>
+
+    <div class="card">
+      <h2>התראות בטלפון</h2>
+      ${!pushSupported ? '<p class="muted">המכשיר הזה לא תומך בהתראות. באייפון: קודם "הוסף למסך הבית" ולפתוח את האפליקציה משם.</p>'
+        : Notification.permission === 'denied' ? '<p class="muted">ההתראות חסומות בהגדרות הדפדפן.</p>'
+        : Notification.permission === 'granted' ? '<p>התראות פעילות במכשיר הזה ✓</p>'
+        : '<p class="muted">קבלו התראה כשילד שולח בקשה, גם כשהאפליקציה סגורה.</p><button class="btn primary" data-action="enable-push">הפעלת התראות במכשיר הזה</button>'}
+    </div>
   `, { tab: 'manage' });
 }
 
@@ -389,6 +412,13 @@ const actions = {
   },
 
   'close-dialog'() { dialog.close(); },
+
+  async 'enable-push'() {
+    if (await Notification.requestPermission() !== 'granted') return toast('ההתראות לא אושרו', 'bad');
+    await subscribePush();
+    toast('ההתראות הופעלו');
+    route();
+  },
 };
 
 const forms = {
@@ -422,7 +452,8 @@ const forms = {
     const kind = d.get('kind');
     if (kind === 'withdraw' && amount > Number(f.dataset.balance) &&
         !confirm(`יש לך רק ${money(f.dataset.balance)}. לשלוח בכל זאת?`)) return;
-    await q(sb.from('requests').insert({ child_id: state.me.child_id, kind, amount, note: d.get('note').trim() }));
+    const [r] = await q(sb.from('requests').insert({ child_id: state.me.child_id, kind, amount, note: d.get('note').trim() }).select('id'));
+    sb.functions.invoke('notify-parents', { body: { request_id: r.id } }); // לא מחכים — כישלון בהתראה לא מפריע לילד
     toast('הבקשה נשלחה להורים');
     route();
   },

@@ -69,8 +69,18 @@ create table if not exists public.requests (
   decision_note  text,
   transaction_id uuid references public.transactions(id)
 );
+-- מתי נשלחה התראת push להורים (נקבע רק ע״י ה-Edge Function, פעם אחת)
+alter table public.requests add column if not exists notified_at timestamptz;
 create index if not exists requests_child_idx on public.requests (child_id, created_at desc);
 create index if not exists requests_pending_idx on public.requests (status) where status = 'pending';
+
+-- מנויי Web Push של ההורים (מכשיר = endpoint)
+create table if not exists public.push_subscriptions (
+  endpoint   text primary key,
+  email      text not null default public.current_email() references public.members(email) on delete cascade,
+  keys       jsonb not null,                                -- {p256dh, auth} מ-PushSubscription.toJSON()
+  created_at timestamptz not null default now()
+);
 
 alter table public.transactions
   drop constraint if exists transactions_request_fk,
@@ -134,6 +144,7 @@ begin
   new.decided_at     := null;
   new.decision_note  := null;
   new.transaction_id := null;
+  new.notified_at    := null;
   return new;
 end $$;
 
@@ -210,6 +221,7 @@ alter table public.children     enable row level security;
 alter table public.members      enable row level security;
 alter table public.transactions enable row level security;
 alter table public.requests     enable row level security;
+alter table public.push_subscriptions enable row level security;
 
 -- ילדים
 drop policy if exists children_select on public.children;
@@ -255,6 +267,11 @@ drop policy if exists requests_insert on public.requests;
 create policy requests_insert on public.requests for insert to authenticated
   with check (child_id = my_child_id());
 
+-- מנויי push: הורה מנהל רק את המכשירים של עצמו
+drop policy if exists push_subscriptions_own on public.push_subscriptions;
+create policy push_subscriptions_own on public.push_subscriptions for all to authenticated
+  using (is_parent() and email = current_email()) with check (is_parent() and email = current_email());
+
 -- ---------- Realtime: הורים מקבלים עדכון מיידי על בקשות (RLS חל גם כאן) ----------
 
 do $$ begin
@@ -266,11 +283,11 @@ end $$;
 
 -- ---------- הרשאות ----------
 
-revoke all on public.children, public.members, public.transactions, public.requests, public.balances from anon;
+revoke all on public.children, public.members, public.transactions, public.requests, public.balances, public.push_subscriptions from anon;
 revoke update, delete on public.requests from authenticated;
 revoke delete on public.transactions, public.children from authenticated;
 grant select, insert, update on public.children, public.transactions to authenticated;
-grant select, insert, update, delete on public.members to authenticated;
+grant select, insert, update, delete on public.members, public.push_subscriptions to authenticated;
 grant select, insert on public.requests to authenticated;
 grant select on public.balances to authenticated;
 
