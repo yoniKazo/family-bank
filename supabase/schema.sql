@@ -20,6 +20,13 @@ $$;
 
 -- ---------- טבלאות ----------
 
+-- כל משפחה רואה ומנהלת רק את הילדים שלה
+create table if not exists public.families (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null check (length(trim(name)) > 0),
+  created_at  timestamptz not null default now()
+);
+
 create table if not exists public.children (
   id          uuid primary key default gen_random_uuid(),
   name        text not null check (length(trim(name)) > 0),
@@ -28,6 +35,7 @@ create table if not exists public.children (
 );
 -- סדר התצוגה (קטן קודם; בשוויון — לפי שם)
 alter table public.children add column if not exists sort_order int not null default 0;
+alter table public.children add column if not exists family_id uuid references public.families(id);
 
 -- רשימת ההרשאות: רק מי שמופיע כאן יכול לראות משהו
 create table if not exists public.members (
@@ -37,6 +45,12 @@ create table if not exists public.members (
   display_name text,
   created_at   timestamptz not null default now(),
   check ((role = 'child') = (child_id is not null))
+);
+alter table public.members add column if not exists family_id uuid references public.families(id);
+
+-- מנהלי המערכת (מוסיפים משפחות). מוגדרים ב-SQL בלבד
+create table if not exists public.admins (
+  email text primary key references public.members(email) on delete cascade
 );
 
 create table if not exists public.transactions (
@@ -98,11 +112,33 @@ returns uuid language sql stable security definer set search_path = public as $$
   select child_id from members where email = current_email() and role = 'child'
 $$;
 
+create or replace function public.my_family_id()
+returns uuid language sql stable security definer set search_path = public as $$
+  select family_id from members where email = current_email()
+$$;
+
+-- הורה של המשפחה שהילד הזה שייך אליה
+create or replace function public.is_parent_of(p_child_id uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from members m join children c on c.family_id = m.family_id
+                 where m.email = current_email() and m.role = 'parent' and c.id = p_child_id)
+$$;
+
+create or replace function public.is_admin()
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from admins where email = current_email())
+$$;
+
+-- ילד / חבר חדש שייך למשפחה של מי שהוסיף אותו
+alter table public.children alter column family_id set default public.my_family_id();
+alter table public.members  alter column family_id set default public.my_family_id();
+
 -- מי אני? (האפליקציה קוראת לזה אחרי התחברות)
-create or replace function public.me()
-returns table (email text, role text, child_id uuid, child_name text, display_name text)
+drop function if exists public.me();
+create function public.me()
+returns table (email text, role text, child_id uuid, child_name text, display_name text, is_admin boolean)
 language sql stable security definer set search_path = public as $$
-  select m.email, m.role, m.child_id, c.name, m.display_name
+  select m.email, m.role, m.child_id, c.name, m.display_name, is_admin()
   from members m left join children c on c.id = m.child_id
   where m.email = current_email()
     and (m.role = 'parent' or c.active)
@@ -176,7 +212,7 @@ begin
   end if;
 
   select * into r from requests where id = p_request_id for update;
-  if not found then raise exception 'הבקשה לא נמצאה'; end if;
+  if not found or not is_parent_of(r.child_id) then raise exception 'הבקשה לא נמצאה'; end if;
   if r.status <> 'pending' then raise exception 'הבקשה כבר טופלה'; end if;
 
   if p_approve then
@@ -209,10 +245,31 @@ begin
      set status = 'cancelled', decided_by = current_email(), decided_at = now()
    where id = p_request_id
      and status = 'pending'
-     and (child_id = my_child_id() or is_parent())
+     and (child_id = my_child_id() or is_parent_of(child_id))
   returning * into r;
   if not found then raise exception 'אי אפשר לבטל את הבקשה הזו'; end if;
   return r;
+end $$;
+
+-- ---------- הוספת משפחה (רק מנהל) ----------
+
+-- p_parents: [{"email": "...", "display_name": "..."}, ...]
+create or replace function public.add_family(p_name text, p_parents jsonb)
+returns public.families language plpgsql security definer set search_path = public as $$
+declare f families;
+begin
+  if not is_admin() then
+    raise exception 'רק מנהל המערכת יכול להוסיף משפחה' using errcode = '42501';
+  end if;
+
+  insert into families (name) values (trim(p_name)) returning * into f;
+  insert into members (email, role, display_name, family_id)
+  select lower(trim(p ->> 'email')), 'parent', nullif(trim(coalesce(p ->> 'display_name', '')), ''), f.id
+  from jsonb_array_elements(p_parents) p;
+
+  return f;
+exception when unique_violation then
+  raise exception 'אחד המיילים כבר רשום במערכת';
 end $$;
 
 -- ---------- Row Level Security ----------
@@ -222,47 +279,55 @@ alter table public.members      enable row level security;
 alter table public.transactions enable row level security;
 alter table public.requests     enable row level security;
 alter table public.push_subscriptions enable row level security;
+alter table public.families     enable row level security;
+alter table public.admins       enable row level security;   -- בלי policies: אין גישה מהאפליקציה
 
--- ילדים
+-- משפחות: רק המנהל רואה את הרשימה; הוספה רק דרך add_family
+drop policy if exists families_select on public.families;
+create policy families_select on public.families for select to authenticated
+  using (is_admin());
+
+-- ילדים: הורה רואה ומנהל רק את הילדים של המשפחה שלו
 drop policy if exists children_select on public.children;
 create policy children_select on public.children for select to authenticated
-  using (is_parent() or id = my_child_id());
+  using ((is_parent() and family_id = my_family_id()) or id = my_child_id());
 drop policy if exists children_insert on public.children;
 create policy children_insert on public.children for insert to authenticated
-  with check (is_parent());
+  with check (is_parent() and family_id = my_family_id());
 drop policy if exists children_update on public.children;
 create policy children_update on public.children for update to authenticated
-  using (is_parent()) with check (is_parent());
+  using (is_parent() and family_id = my_family_id()) with check (is_parent() and family_id = my_family_id());
 
--- חברים: הורים מנהלים רק שורות של ילדים. שורות הורים מוגדרות ב-SQL בלבד.
+-- חברים: הורים מנהלים רק שורות של ילדים במשפחה שלהם. שורות הורים — ב-SQL או ע״י המנהל (add_family).
 drop policy if exists members_select on public.members;
 create policy members_select on public.members for select to authenticated
-  using (is_parent() or email = current_email());
+  using ((is_parent() and family_id = my_family_id()) or email = current_email() or (role = 'parent' and is_admin()));
 drop policy if exists members_insert on public.members;
 create policy members_insert on public.members for insert to authenticated
-  with check (is_parent() and role = 'child');
+  with check (role = 'child' and family_id = my_family_id() and is_parent_of(child_id));
 drop policy if exists members_update on public.members;
 create policy members_update on public.members for update to authenticated
-  using (is_parent() and role = 'child') with check (is_parent() and role = 'child');
+  using (is_parent() and role = 'child' and family_id = my_family_id())
+  with check (role = 'child' and family_id = my_family_id() and is_parent_of(child_id));
 drop policy if exists members_delete on public.members;
 create policy members_delete on public.members for delete to authenticated
-  using (is_parent() and role = 'child');
+  using (is_parent() and role = 'child' and family_id = my_family_id());
 
 -- תנועות: ילד רואה רק את שלו ורק פעולות שלא בוטלו; אין מחיקה בכלל
 drop policy if exists transactions_select on public.transactions;
 create policy transactions_select on public.transactions for select to authenticated
-  using (is_parent() or (child_id = my_child_id() and not voided));
+  using (is_parent_of(child_id) or (child_id = my_child_id() and not voided));
 drop policy if exists transactions_insert on public.transactions;
 create policy transactions_insert on public.transactions for insert to authenticated
-  with check (is_parent());
+  with check (is_parent_of(child_id));
 drop policy if exists transactions_update on public.transactions;
 create policy transactions_update on public.transactions for update to authenticated
-  using (is_parent()) with check (is_parent());
+  using (is_parent_of(child_id)) with check (is_parent_of(child_id));
 
 -- בקשות: ילד יוצר בקשה רק לעצמו; שינויי סטטוס רק דרך ה-RPC
 drop policy if exists requests_select on public.requests;
 create policy requests_select on public.requests for select to authenticated
-  using (is_parent() or child_id = my_child_id());
+  using (is_parent_of(child_id) or child_id = my_child_id());
 drop policy if exists requests_insert on public.requests;
 create policy requests_insert on public.requests for insert to authenticated
   with check (child_id = my_child_id());
@@ -283,23 +348,46 @@ end $$;
 
 -- ---------- הרשאות ----------
 
-revoke all on public.children, public.members, public.transactions, public.requests, public.balances, public.push_subscriptions from anon;
+revoke all on public.children, public.members, public.transactions, public.requests, public.balances, public.push_subscriptions,
+              public.families, public.admins from anon;
+revoke all on public.families, public.admins from authenticated;
 revoke update, delete on public.requests from authenticated;
 revoke delete on public.transactions, public.children from authenticated;
 grant select, insert, update on public.children, public.transactions to authenticated;
 grant select, insert, update, delete on public.members, public.push_subscriptions to authenticated;
 grant select, insert on public.requests to authenticated;
-grant select on public.balances to authenticated;
+grant select on public.balances, public.families to authenticated;
 
-revoke execute on function public.decide_request(uuid, boolean, text), public.cancel_request(uuid),
-                           public.me(), public.is_parent(), public.my_child_id() from public, anon;
-grant  execute on function public.decide_request(uuid, boolean, text), public.cancel_request(uuid),
-                           public.me(), public.is_parent(), public.my_child_id() to authenticated;
+revoke execute on function public.decide_request(uuid, boolean, text), public.cancel_request(uuid), public.add_family(text, jsonb),
+                           public.me(), public.is_parent(), public.my_child_id(), public.my_family_id(),
+                           public.is_parent_of(uuid), public.is_admin() from public, anon;
+grant  execute on function public.decide_request(uuid, boolean, text), public.cancel_request(uuid), public.add_family(text, jsonb),
+                           public.me(), public.is_parent(), public.my_child_id(), public.my_family_id(),
+                           public.is_parent_of(uuid), public.is_admin() to authenticated;
 
 -- ============================================================
---  ההורים — להחליף למיילים האמיתיים (Gmail) ולהריץ
+--  המשפחה שלך וההורים — להחליף למיילים האמיתיים (Gmail) ולהריץ.
+--  ההורה הראשון הוא גם מנהל המערכת: רק הוא יכול להוסיף משפחות.
 -- ============================================================
-insert into public.members (email, role, display_name) values
-  ('yonu.kazokin@gmail.com', 'parent', 'אבא'),
-  ('yonuka3@gmail.com', 'parent', 'אמא')
-on conflict (email) do update set role = 'parent', display_name = excluded.display_name;
+do $$
+declare f uuid;
+begin
+  select family_id into f from public.members where email = 'yonu.kazokin@gmail.com';
+  if f is null then
+    insert into public.families (name) values ('קזוקין') returning id into f;
+  end if;
+
+  insert into public.members (email, role, display_name, family_id) values
+    ('yonu.kazokin@gmail.com', 'parent', 'אבא', f),
+    ('yonuka3@gmail.com',      'parent', 'אמא', f)
+  on conflict (email) do update set role = 'parent', display_name = excluded.display_name, family_id = excluded.family_id;
+
+  -- נתונים מלפני שהיו משפחות שייכים למשפחה הזו
+  update public.children set family_id = f where family_id is null;
+  update public.members  set family_id = f where family_id is null;
+end $$;
+
+insert into public.admins (email) values ('yonu.kazokin@gmail.com') on conflict do nothing;
+
+alter table public.children alter column family_id set not null;
+alter table public.members  alter column family_id set not null;

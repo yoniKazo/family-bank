@@ -33,7 +33,7 @@ Deno.serve(async (req) => {
     .eq('id', request_id)
     .eq('created_by', user.email.toLowerCase())
     .is('notified_at', null)
-    .select('kind, amount, note, children(name)')
+    .select('kind, amount, note, children(name, family_id)')
     .maybeSingle();
   if (!r) return new Response('nothing to send', { headers: cors });
 
@@ -42,7 +42,10 @@ Deno.serve(async (req) => {
     body: `${r.kind === 'deposit' ? 'הפקדה' : 'משיכה'} של ${money.format(r.amount)}${r.note ? ` — ${r.note}` : ''}`,
   });
 
-  const { data: subs } = await admin.from('push_subscriptions').select('endpoint, keys');
+  // רק המכשירים של ההורים במשפחה של הילד
+  const { data: subs } = await admin.from('push_subscriptions')
+    .select('endpoint, keys, members!inner(family_id)')
+    .eq('members.family_id', r.children.family_id);
   await Promise.all((subs ?? []).map((s) =>
     webpush.sendNotification({ endpoint: s.endpoint, keys: s.keys }, payload).catch((e) =>
       e.statusCode === 404 || e.statusCode === 410

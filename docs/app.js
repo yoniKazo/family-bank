@@ -281,9 +281,12 @@ async function parentRequests() {
 }
 
 async function parentManage() {
-  const [children, members] = await Promise.all([
+  const [children, members, families] = await Promise.all([
     q(sb.from('children').select('*').order('active', { ascending: false }).order('sort_order').order('name')),
     q(sb.from('members').select('*').eq('role', 'child')),
+    state.me.is_admin
+      ? q(sb.from('families').select('id, name, members(email, display_name, role)').eq('members.role', 'parent').order('created_at'))
+      : [],
   ]);
   const emailOf = Object.fromEntries(members.map((m) => [m.child_id, m.email]));
   app.innerHTML = shell(`
@@ -306,6 +309,28 @@ async function parentManage() {
         </form>
       </li>`).join('')}</ul>` : '<p class="empty">עוד אין ילדים</p>'}
     <p class="muted small">ילד לא פעיל נעלם מהמסך הראשי ולא יכול להתחבר. ההיסטוריה שלו נשמרת.</p>
+
+    ${state.me.is_admin ? `
+      <form class="card form" data-form="add-family">
+        <h2>הוספת משפחה</h2>
+        <label class="field"><span>שם המשפחה</span><input name="name" required maxlength="40"></label>
+        <div class="row">
+          <label class="field grow"><span>מייל Google של הורה</span><input name="email1" type="email" dir="ltr" required placeholder="name@gmail.com"></label>
+          <label class="field"><span>כינוי</span><input name="name1" maxlength="20" placeholder="אבא"></label>
+        </div>
+        <div class="row">
+          <label class="field grow"><span>מייל Google של הורה נוסף (לא חובה)</span><input name="email2" type="email" dir="ltr" placeholder="name@gmail.com"></label>
+          <label class="field"><span>כינוי</span><input name="name2" maxlength="20" placeholder="אמא"></label>
+        </div>
+        <button class="btn primary">הוספה</button>
+      </form>
+
+      <h2>משפחות</h2>
+      <ul class="list">${families.map((f) => `
+        <li>
+          <b>${esc(f.name)}</b>
+          <div class="tx-meta">${f.members.map((m) => `${esc(m.display_name || '')} <span dir="ltr">${esc(m.email)}</span>`).join(' · ')}</div>
+        </li>`).join('')}</ul>` : ''}
 
     <div class="card">
       <h2>התראות בטלפון</h2>
@@ -476,6 +501,16 @@ const forms = {
       if (email) await q(sb.from('members').insert({ email, role: 'child', child_id: id, display_name: name }));
     }
     toast('נשמר');
+    route();
+  },
+
+  async 'add-family'(f, d) {
+    const name = d.get('name').trim();
+    const parents = [1, 2]
+      .map((i) => ({ email: d.get(`email${i}`).trim(), display_name: d.get(`name${i}`).trim() }))
+      .filter((p) => p.email);
+    await q(sb.rpc('add_family', { p_name: name, p_parents: parents }));
+    toast(`משפחת ${name} נוספה`);
     route();
   },
 };
